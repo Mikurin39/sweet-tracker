@@ -1,13 +1,17 @@
-import { zodOutputFormat } from "@anthropic-ai/sdk/helpers/zod";
-import { anthropic } from "./anthropic";
+import { GoogleGenAI, Type, type Schema } from "@google/genai";
 import {
   ReceiptExtractionSchema,
   type ReceiptExtraction,
+  CATEGORY_SLUGS,
+  STORE_KINDS,
 } from "./receipt-schema";
 
 export type ReceiptImageMediaType = "image/jpeg" | "image/png" | "image/webp";
 
-const EXTRACTION_PROMPT = `あなたは日本のレシートを読み取るアシスタントです。画像のレシートから情報を構造化して抽出してください。
+// gemini-2.0-flash: fast, vision-capable, available on the free tier.
+const MODEL = "gemini-2.0-flash";
+
+const EXTRACTION_PROMPT = `あなたは日本のレシートを読み取るアシスタントです。画像のレシートから情報を抽出してください。
 
 - store_name: 店舗名（例: セブン-イレブン○○店）。読み取れなければ null。
 - store_kind: 店舗種別を convenience / supermarket / drugstore / restaurant / other から推定。
@@ -28,40 +32,85 @@ suggested_category の基準:
 
 金額は必ず円単位の整数で、小数や通貨記号は含めないでください。値引き行は商品の amount に反映するか、別行として負の金額で表しても構いません。判別できない項目は other としてください。`;
 
-/** Extract structured receipt data from an image using Claude vision. */
+// Gemini structured-output schema (mirrors ReceiptExtractionSchema).
+const RESPONSE_SCHEMA: Schema = {
+  type: Type.OBJECT,
+  properties: {
+    store_name: { type: Type.STRING, nullable: true },
+    store_kind: { type: Type.STRING, enum: [...STORE_KINDS] },
+    purchased_at: { type: Type.STRING, nullable: true },
+    total_amount: { type: Type.NUMBER, nullable: true },
+    currency: { type: Type.STRING },
+    items: {
+      type: Type.ARRAY,
+      items: {
+        type: Type.OBJECT,
+        properties: {
+          name: { type: Type.STRING },
+          quantity: { type: Type.NUMBER },
+          unit_price: { type: Type.NUMBER, nullable: true },
+          amount: { type: Type.NUMBER },
+          suggested_category: { type: Type.STRING, enum: [...CATEGORY_SLUGS] },
+        },
+        required: [
+          "name",
+          "quantity",
+          "unit_price",
+          "amount",
+          "suggested_category",
+        ],
+      },
+    },
+    confidence: { type: Type.NUMBER },
+  },
+  required: [
+    "store_name",
+    "store_kind",
+    "purchased_at",
+    "total_amount",
+    "currency",
+    "items",
+    "confidence",
+  ],
+};
+
+/** Extract structured receipt data from an image using Gemini vision. */
 export async function extractReceipt(params: {
   base64: string;
   mediaType: ReceiptImageMediaType;
 }): Promise<ReceiptExtraction> {
-  const response = await anthropic.messages.parse({
-    model: "claude-opus-4-8",
-    max_tokens: 4096,
-    // Mechanical extraction — low effort keeps latency/cost down.
-    output_config: {
-      effort: "low",
-      format: zodOutputFormat(ReceiptExtractionSchema),
-    },
-    messages: [
+  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+  const response = await ai.models.generateContent({
+    model: MODEL,
+    contents: [
       {
         role: "user",
-        content: [
-          {
-            type: "image",
-            source: {
-              type: "base64",
-              media_type: params.mediaType,
-              data: params.base64,
-            },
-          },
-          { type: "text", text: EXTRACTION_PROMPT },
+        parts: [
+          { inlineData: { mimeType: params.mediaType, data: params.base64 } },
+          { text: EXTRACTION_PROMPT },
         ],
       },
     ],
+    config: {
+      responseMimeType: "application/json",
+      responseSchema: RESPONSE_SCHEMA,
+    },
   });
 
-  const parsed = response.parsed_output;
-  if (!parsed) {
-    throw new Error("レシートの解析に失敗しました");
+  const text = response.text;
+  if (!text) throw new Error("レシートの解析に失敗しました");
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    throw new Error("レシートの解析結果を読み取れませんでした");
   }
-  return parsed;
+
+  const result = ReceiptExtractionSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new Error("レシートの解析結果が不正でした");
+  }
+  return result.data;
 }
