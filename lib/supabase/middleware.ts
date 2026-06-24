@@ -2,7 +2,7 @@ import { createServerClient } from "@supabase/ssr";
 import { NextResponse, type NextRequest } from "next/server";
 
 /** Public path prefixes that do not require authentication. */
-const PUBLIC_PATHS = ["/login", "/auth", "/api/debug-env"];
+const PUBLIC_PATHS = ["/login", "/auth"];
 
 function isPublic(pathname: string) {
   return PUBLIC_PATHS.some(
